@@ -2,7 +2,8 @@
 #include "http.hpp"
 #include <vector>
 
-nlohmann::json place_market_order(bool sandbox,
+nlohmann::json place_market_order(const std::string& product_id,
+                                  bool               sandbox,
                                   const std::string& side,
                                   const std::string& base_size,
                                   const std::string& bearer_token) {
@@ -11,21 +12,20 @@ nlohmann::json place_market_order(bool sandbox,
     const std::string url  = host + "/api/v3/brokerage/orders";
 
     nlohmann::json body = {
-        {"client_order_id", "client_" + side},
-        {"product_id", "ETH-USD"},
-        {"side", side},
+        {"client_order_id", "client_" + side + "_" + product_id},
+        {"product_id",      product_id},
+        {"side",            side},
         {"order_configuration", {
-            {"market_market_ioc", { {"base_size", base_size} }}
+            {"market_market_ioc", {{"base_size", base_size}}}
         }}
     };
 
     std::vector<std::string> headers = {"Content-Type: application/json"};
-    if (!bearer_token.empty()) {
+    if (!bearer_token.empty())
         headers.push_back("Authorization: Bearer " + bearer_token);
-    }
 
-    // NOTE: Without a valid Authorization header, Coinbase will likely reject the request.
-    // Keep --dry-run true until you wire proper JWT/HMAC.
+    // NOTE: Coinbase Advanced Trade requires HMAC-signed JWT.
+    // Keep --dry-run true until authentication is wired up.
     auto resp = http_post(url, body.dump(), headers);
     return nlohmann::json::parse(resp);
 }

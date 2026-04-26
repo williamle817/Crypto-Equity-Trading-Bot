@@ -1,0 +1,23 @@
+{
+  "data_api":         "http://localhost:8000",
+  "granularity":      "ONE_MINUTE",
+  "lookback":         300,
+  "strategy":         "COMBINED",
+  "ema_fast":         12,
+  "ema_slow":         26,
+  "rsi_period":       14,
+  "rsi_oversold":     30.0,
+  "rsi_overbought":   70.0,
+  "bb_period":        20,
+  "bb_std":           2.0,
+  "sandbox":          true,
+  "dry_run":          true,
+  "max_daily_loss":   50.0,
+  "cooldown_seconds": 60,
+  "long_only":        true,
+  "assets": [
+    { "product_id": "ETH-USD",  "size": "0.01",   "max_position": 0.05  },
+    { "product_id": "BTC-USD",  "size": "0.0003", "max_position": 0.001 },
+    { "product_id": "SOL-USD",  "size": "0.1",    "max_position": 1.0   }
+  ]
+}

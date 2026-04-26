@@ -1,121 +1,168 @@
-#include "ema.hpp"
-#include "strategy.hpp"
+#include "config.hpp"
 #include "data_client.hpp"
+#include "ema.hpp"
+#include "rsi.hpp"
+#include "bollinger.hpp"
+#include "strategy.hpp"
 #include "order_placer.hpp"
-#include <iostream>
-#include <string>
 #include "risk.hpp"
 #include "logger.hpp"
+#include "metrics.hpp"
+#include <iostream>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 
-struct Config {
-    std::string data_api = "http://localhost:8000";
-    std::string product = "ETH-USD";
-    std::string granularity = "ONE_MINUTE";
-    int lookback = 300;
-    int fast = 12;
-    int slow = 26;
-    std::string size = "0.01";
-    bool sandbox = true;
-    bool dry_run = true;
-};
+// ── helpers ──────────────────────────────────────────────────────────────────
 
-Config parse_args(int argc, char** argv) {
-
-    Config c;
-    for (int i=1; i<argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](int& i)->std::string{ if(i+1<argc) return std::string(argv[++i]); throw std::runtime_error("Missing value for "+a); };
-        if (a=="--api") c.data_api = next(i);
-        else if (a=="--product") c.product = next(i);
-        else if (a=="--granularity") c.granularity = next(i);
-        else if (a=="--lookback") c.lookback = std::stoi(next(i));
-        else if (a=="--fast") c.fast = std::stoi(next(i));
-        else if (a=="--slow") c.slow = std::stoi(next(i));
-        else if (a=="--size") c.size = next(i);
-        else if (a=="--sandbox") c.sandbox = (next(i)=="true");
-        else if (a=="--dry-run") c.dry_run = (next(i)=="true");
-        else if (a=="-h" || a=="--help") {
-            std::cout << "Usage: ethbot [--api URL] [--product ETH-USD] [--granularity ONE_MINUTE]\n"
-                         "              [--lookback 300] [--fast 12] [--slow 26] [--size 0.01]\n"
-                         "              [--sandbox true|false] [--dry-run true|false]\n";
-            std::exit(0);
-        }
-    }
-    if (c.fast<=0 || c.slow<=0 || c.fast>=c.slow) throw std::runtime_error("Require 0 < fast < slow");
-    return c;
-}
-
-int main(int argc, char** argv) {
-    try {
-        Config cfg = parse_args(argc, argv);
-        auto candles = fetch_candles_local(cfg.data_api, cfg.product, cfg.granularity, cfg.lookback);
-        std::cout << "Fetched candles: " << candles.size() << "\n";
-
-        EMA ema_f(cfg.fast), ema_s(cfg.slow);
-        CrossState cs;
-
-        logger_init("logs/strategy_log.csv");
-
-        RiskLimits limits;
-        limits.max_position_abs = 0.05;
-        limits.max_daily_loss   = 50.0;
-        limits.cooldown_seconds = 60;
-        limits.long_only        = true;
-
-        RiskState rstate;
-
-        for (auto& k : candles) {
-            double f = ema_f.update(k.close);
-            double s = ema_s.update(k.close);
-            if (!(ema_f.ready() && ema_s.ready())) {
-                std::cout << k.start << " price=" << k.close << " warming up\n";
-                continue;
-            }
-            auto sig = crossover_signal(cs, f, s);
-            auto sigstr = sigstr_from_signal(sig);
-
-            // default: no acion
-            std::string action = "NONE";
-            std::string reason;
-            if (sig == Signal::BUY || sig == Signal::SELL) {
-                Side side = side_from_signal(sig);
-
-                bool ok = allow_order(limits, rstate, side, std::stod(cfg.size), k.close, k.start, reason);
-                if (!ok) {
-                    action = "BLOCKED";
-                    logger_row(k.start, k.close, f, s, sigstr, action, rstate.position_eth, rstate.realized_pnl, reason);
-                    std::cout << "BLOCKED: " << reason << "\n";
-                } else if (cfg.dry_run) {
-                    action = (sig == Signal::BUY ? "BUY" : "SELL");
-                    on_fill(rstate, side, std::stod(cfg.size), k.close, k.start);
-                    logger_row(k.start, k.close, f, s, sigstr, action, rstate.position_eth, rstate.realized_pnl, "");
-                    std::cout << "DRY-RUN FILLED " << action << " " << cfg.size
-                            << " @ " << k.close << " pos=" << rstate.position_eth
-                            << " pnl=" << rstate.realized_pnl << "\n";
-                } else {
-                    action = (sig == Signal::BUY ? "BUY" : "SELL");
-                    std::string bearer;
-                    auto j = place_market_order(cfg.sandbox, action, cfg.size, bearer);
-                    on_fill(rstate, side, std::stod(cfg.size), k.close, k.start);
-                    logger_row(k.start, k.close, f, s, sigstr, action, rstate.position_eth, rstate.realized_pnl, "");
-                    std::cout << "LIVE order response: " << j.dump() << "\n";
-                }
-            } else {
-                logger_row(k.start, k.close, f, s, sigstr, action, rstate.position_eth, rstate.realized_pnl, "");
-            }
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\n";
-        return 1;
-    }
-}
-
-static SigStr sigstr_from_signal(Signal s) {
+static SigStr sigstr_from(Signal s) {
     if (s == Signal::BUY)  return SigStr::Buy;
     if (s == Signal::SELL) return SigStr::Sell;
     return SigStr::Hold;
 }
-static Side side_from_signal(Signal s) {
+
+static Side side_from(Signal s) {
     return (s == Signal::SELL) ? Side::Sell : Side::Buy;
+}
+
+// ── per-asset strategy run ───────────────────────────────────────────────────
+
+static void run_asset(const Config& cfg, const AssetConfig& asset) {
+    std::cout << "\n=== " << asset.product_id
+              << " | strategy=" << strategy_name(cfg.strategy) << " ===\n";
+
+    auto candles = fetch_candles_local(cfg.data_api, asset.product_id,
+                                       cfg.granularity, cfg.lookback);
+    if (candles.empty()) {
+        std::cerr << "No candles fetched for " << asset.product_id << "\n";
+        return;
+    }
+    std::cout << "Fetched " << candles.size() << " candles\n";
+
+    EMA      ema_f(cfg.ema_fast), ema_s(cfg.ema_slow);
+    RSI      rsi_ind(cfg.rsi_period);
+    Bollinger bb(cfg.bb_period, cfg.bb_std);
+    CrossState cs{};
+
+    RiskLimits limits;
+    limits.max_position_abs = asset.max_position;
+    limits.max_daily_loss   = cfg.max_daily_loss;
+    limits.cooldown_seconds = cfg.cooldown_seconds;
+    limits.long_only        = cfg.long_only;
+
+    RiskState rstate{};
+    MetricsTracker metrics;
+
+    // One CSV log per asset: logs/ETH_USD.csv
+    std::string log_name = asset.product_id;
+    std::replace(log_name.begin(), log_name.end(), '-', '_');
+    logger_init("logs/" + log_name + ".csv");
+
+    auto now_ts = static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    for (const auto& k : candles) {
+        double f  = ema_f.update(k.close);
+        double s  = ema_s.update(k.close);
+        double rv = rsi_ind.update(k.close);
+        auto   bb_val = bb.update(k.close);
+
+        metrics.record_equity_point(rstate.realized_pnl);
+
+        if (!(ema_f.ready() && ema_s.ready())) continue;
+
+        // ── signal selection ──────────────────────────────────────────────
+        bool indicators_ready = rsi_ind.ready() && bb.ready();
+        Signal sig = Signal::HOLD;
+
+        switch (cfg.strategy) {
+            case StrategyType::EMA_CROSS:
+                sig = crossover_signal(cs, f, s);
+                break;
+            case StrategyType::RSI:
+                if (indicators_ready)
+                    sig = rsi_signal(rv, cfg.rsi_oversold, cfg.rsi_overbought);
+                break;
+            case StrategyType::BOLLINGER:
+                if (indicators_ready)
+                    sig = bollinger_signal(k.close, bb_val.lower, bb_val.upper, bb_val.pct_b);
+                break;
+            case StrategyType::COMBINED:
+                if (indicators_ready) {
+                    Signals sigs{
+                        crossover_signal(cs, f, s),
+                        rsi_signal(rv, cfg.rsi_oversold, cfg.rsi_overbought),
+                        bollinger_signal(k.close, bb_val.lower, bb_val.upper, bb_val.pct_b)
+                    };
+                    sig = combined_signal(sigs);
+                } else {
+                    sig = crossover_signal(cs, f, s); // fallback while warming up
+                }
+                break;
+        }
+
+        SigStr sigstr = sigstr_from(sig);
+
+        if (sig == Signal::HOLD) {
+            logger_row(k.start, k.close, f, s, sigstr, "NONE",
+                       rstate.position_eth, rstate.realized_pnl, "");
+            continue;
+        }
+
+        // ── risk gate ─────────────────────────────────────────────────────
+        Side        side = side_from(sig);
+        double      sz   = std::stod(asset.size);
+        std::string reason;
+        bool ok = allow_order(limits, rstate, side, sz, k.close,
+                              now_ts + k.start, reason);
+
+        if (!ok) {
+            logger_row(k.start, k.close, f, s, sigstr, "BLOCKED",
+                       rstate.position_eth, rstate.realized_pnl, reason);
+            continue;
+        }
+
+        std::string action = (sig == Signal::BUY) ? "BUY" : "SELL";
+
+        if (cfg.dry_run) {
+            on_fill(rstate, side, sz, k.close, k.start);
+            logger_row(k.start, k.close, f, s, sigstr, action,
+                       rstate.position_eth, rstate.realized_pnl, "DRY-RUN");
+            metrics.record_fill(k.start, side, sz, k.close, rstate.realized_pnl);
+            std::cout << action << " " << asset.size << " " << asset.product_id
+                      << " @ " << k.close
+                      << " pos=" << rstate.position_eth
+                      << " pnl=" << rstate.realized_pnl << "\n";
+        } else {
+            auto resp = place_market_order(asset.product_id, cfg.sandbox,
+                                           action, asset.size, "");
+            on_fill(rstate, side, sz, k.close, k.start);
+            logger_row(k.start, k.close, f, s, sigstr, action,
+                       rstate.position_eth, rstate.realized_pnl, "LIVE");
+            metrics.record_fill(k.start, side, sz, k.close, rstate.realized_pnl);
+            std::cout << "LIVE " << action << " resp: " << resp.dump() << "\n";
+        }
+    }
+
+    metrics.print_summary(asset.product_id);
+}
+
+// ── entry point ──────────────────────────────────────────────────────────────
+
+int main(int argc, char* argv[]) {
+    try {
+        Config cfg = Config::from_args(argc, argv);
+        cfg.validate();
+        cfg.print();
+
+        for (const auto& asset : cfg.assets)
+            run_asset(cfg, asset);
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal: " << e.what() << "\n";
+        return 1;
+    }
 }
